@@ -1,19 +1,38 @@
 import { NestExpressApplication } from '@nestjs/platform-express';
-import { VersioningType } from '@nestjs/common';
+import { ValidationPipe, VersioningType } from '@nestjs/common';
+import { HttpExceptionFilter } from './config/http-exception';
+import { Logger, LoggerErrorInterceptor } from 'nestjs-pino';
 import { AppModule } from '@/app/app.module';
 import { NestFactory } from '@nestjs/core';
-import { Logger, LoggerErrorInterceptor } from 'nestjs-pino';
-import { HttpExceptionFilter } from './config/http-exception';
+import { RedisStore } from "connect-redis";
+import cookieParser from "cookie-parser";
+import compression from "compression";
+import session from 'express-session';
+import { createClient } from "redis";
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     abortOnError: false,
     autoFlushLogs: true,
     bufferLogs: true,
+    logger: false,
     rawBody: true
   });
 
-  app.set("trust proxy", 1);
+  const logger = app.get(Logger);
+
+  const redis = createClient({
+    socket: {
+      host: process.env.RD_HOST!,
+      port: parseInt(process.env.RD_PORT!)
+    },
+    password: process.env.RD_PASS!
+  });
+
+  await redis.connect();
+
+  app.set("trust proxy", "loopback");
   app.setGlobalPrefix("api");
 
   app.enableVersioning({
@@ -29,20 +48,52 @@ async function bootstrap() {
     credentials: true
   });
 
-  app.useLogger(app.get(Logger));
+  app.useLogger(logger);
   app.useGlobalInterceptors(new LoggerErrorInterceptor());
   app.useGlobalFilters(new HttpExceptionFilter);
-  app.useBodyParser("urlencoded", { extends: true });
+  app.useBodyParser("urlencoded", { extended: true, limit: "50mb" });
   app.useBodyParser("json", { limit: "50mb" });
+  app.use(compression({ level: 6, threshold: 1024 }));
+  app.use(cookieParser(process.env.SECRET!));
+  app.disable("x-powered-by");
 
+  app.use(session({
+    secret: process.env.SECRET!,
+    resave: false,
+    saveUninitialized: false,
+    store: new RedisStore({ client: redis }),
+    proxy: process.env.ENV! != "dev",
+    cookie: {
+      httpOnly: true,
+      secure: process.env.ENV! != "dev",
+      sameSite: process.env.ENV! != "dev" ? "none" : "lax",
+      path: "/"
+    }
+  }));
+
+  app.useGlobalPipes(new ValidationPipe({
+    transform: true,
+    whitelist: true,
+    forbidNonWhitelisted: true
+  }));
+
+  const swagger_config = new DocumentBuilder()
+    .setTitle("API")
+    .setDescription("API Rest documentation")
+    .addApiKey()
+    .setVersion("1.0")
+    .build();
+
+  const swagger = SwaggerModule.createDocument(app, swagger_config);
+
+  SwaggerModule.setup("docs", app, swagger, {
+    customSiteTitle: "API Backend",
+    jsonDocumentUrl: "swagger/json",
+    useGlobalPrefix: true
+  });
 
   await app.listen(parseInt(process.env.PORT!), () => {
-    console.log("");
-    console.log("-------------------------------------------------");
-    console.log(` 🟢 API SERVICE RUNNING 🚀`);
-    console.log(` 🔗 URL: http://localhost:${process.env.PORT}`);
-    console.log("-------------------------------------------------");
-    console.log("");
+    logger.log(`Server is running on http://localhost:${process.env.PORT}`);
   });
 }
 
